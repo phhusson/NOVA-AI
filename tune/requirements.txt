@@ -1,0 +1,6 @@
+unsloth @ git+https://github.com/unslothai/unsloth
+accelerate
+bitsandbytes
+transformers
+xformers
+peft
