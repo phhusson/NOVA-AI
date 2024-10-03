@@ -12,7 +12,8 @@ import xml.etree.ElementTree as ET
 
 def togetherxyz_complete(txt, max_tokens = 64):
     data = {
-        'model': 'meta-llama/Llama-3.2-3B-Instruct-Turbo',
+        #'model': 'meta-llama/Llama-3.2-3B-Instruct-Turbo',
+        'model': 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
         'max_tokens': max_tokens,
         'stream_tokens': False,
         "stop": ["</s>", "[/INST]"],
@@ -31,7 +32,7 @@ def togetherxyz_complete(txt, max_tokens = 64):
 def llamacpp_complete(txt):
     data = {
         'stream': False,
-        'n_predict': 1024,
+        'n_predict': 128,
         "stop": ["</s>", "[/INST]"],
         'temperature': 0.35,
         'top_k': 40,
@@ -46,7 +47,6 @@ def llamacpp_complete(txt):
     return json.loads(response.text)['content']
 
 def continue_prompt(backend, discussion):
-
     if backend == 'togetherxyz':
         content = togetherxyz_complete(discussion)
     elif backend == 'llamacpp':
@@ -54,6 +54,7 @@ def continue_prompt(backend, discussion):
     else:
         print("unknown llm backend")
         sys.exit(1)
+    lines = content.split("\n")
     okay_lines = [line for line in content.split("\n") if
                   line.startswith('Assistant:') or line.startswith('Thoughts:')]
     return okay_lines
@@ -64,11 +65,14 @@ You are a helpful assistant to 'User'. You do not respond as 'User' or pretend t
 Your role is to answer user's requests, using pseudo-python commands serialized to JSON.
 Your pseudo-python commands will have lines starting with 'Assistant:'
 Your pseudo-python also has math operators + - * /
-Finish every command with </s>
+Your python lines are limited to 200 characters.
+Nothing will be displayed to the user except your `say` commands
+Finish your turn with </s>
+You always need to finish your turn with end()
 
 Available functions are:
-- headlines: Get the newspaper's headlines. Example: headlines()</s> returns ["Michel Barnier invité de France 2", "La FIFA repousse encore sa décision"]
-- say: You can say anything. Example: say("Il fait beau aujourd'hui")</s>
+- headlines: Get the newspaper's headlines. Example: headlines()</s> returns ["Tintin a la patate", "Coluche fait rire"]
+- say: You can say anything to the user. Takes only a string. Example: say("Il fait beau aujourd'hui")</s>
 - end: End your turn. Example: end</s>
 
 Example:
@@ -76,7 +80,14 @@ User: Combien font 3+4?
 Thoughts: Let's compute 3+4 then show the result to the user
 Assistant: 3+4</s>
 System: 7
-Assistant: say("Le résultat est 7")</s>
+Assistant: say("Le résultat est 7")
+Assistant: end()</s>
+
+Example:
+User: are there news about tintin?
+Assistant: headlines()
+System: ["tintin va sur la lune", "coluche en moto", "Dupont et Dupond enfermés"]
+Assistant: say("Yes, there is one newspiece mentioning tintin is going to the moon")
 Assistant: end()</s>
 
 Example:
@@ -88,7 +99,7 @@ def headlines():
     resp.raise_for_status()
 
     xmlroot = ET.fromstring(resp.content)
-    items = xmlroot.findall('//item')
+    items = xmlroot.findall('.//item')
     titles = [item.find('title').text for item in items]
 
     return titles
@@ -104,6 +115,9 @@ funcs = {"headlines": headlines, "say": say}
 
 def pseudo_py_eval(node, oob):
     if isinstance(node, ast.Module):
+        if isinstance(node.body[0], ast.For):
+            oob["error"] = "Invalid syntax, for loop unsupported"
+            return None
         return pseudo_py_eval(node.body[0].value, oob)
     if isinstance(node, ast.Call):
         if node.func.id == 'end':
@@ -124,19 +138,13 @@ def pseudo_py_eval(node, oob):
         r = node.right
         return operators[type(o)](pseudo_py_eval(l, oob), pseudo_py_eval(r, oob))
     else:
-        return None
-
-def pseudo_py(s, oob):
-    try:
-        tree = ast.parse(s)
-        return pseudo_py_eval(tree, oob)
-    except SyntaxError as e:
-        print(f"Invalid syntax: {e}")
+        oob['error'] = "Unsupported syntax"
         return None
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser()
     argparser.add_argument('-d', '--debug', action='store_true')
+    argparser.add_argument('-v', '--verbose', action='store_true')
     argparser.add_argument('-b', '--backend', default = 'togetherxyz', choices = ['togetherxyz', 'llamacpp'])
     args = argparser.parse_args()
 
@@ -147,13 +155,19 @@ if __name__ == '__main__':
     while True:
         res = None
         oob = {}
+        executed = False
         while len(lines) > 0:
             line = lines.pop(0)
             if args.debug:
                 print("RX: " + line)
 
-            discussion += line + "\n"
-            executed = False
+            # From here LLM is hallucinating, so stop here
+            if line.startswith("System:") or line.startswith("User:"):
+                lines = []
+                break
+
+            if line.startswith("Thoughts:"):
+                discussion += line + "\n"
             if line.startswith("Assistant:"):
                 l = line[len("Assistant:"):]
                 # Sometimes the APIs send the final </s> tag, sometimes they don't
@@ -161,18 +175,45 @@ if __name__ == '__main__':
                 if l.endswith("</s>"):
                     l = l[:-4]
                 l = l.strip()
-                print("$", l)
-                res = pseudo_py(l, oob)
-                executed = True
-                break
+                try:
+                    tree = ast.parse(l)
+                    # Print line **after** parsing in case it's an invalid line
+                    if args.verbose:
+                        print("$", l)
+                    res = pseudo_py_eval(tree, oob)
+                    executed = True
+                    discussion += line + "\n"
+                    if res is not None:
+                        break
+                    if 'end' in oob and oob['end']:
+                        break
+                    if 'error' in oob:
+                        break
+                except SyntaxError as e:
+                    # Ignore lines that haven't been parsed if it's not the first one
+                    # In all likelihood it'll be cut lines
+                    if not executed:
+                        print("Parsing error", [e, l])
+                    executed = True
+                    discussion += line + "\n"
+                    oob['error'] = str(e)
+                    break
 
-        if res is not None:
-            discussion += "System: " + str(res) + "\n"
+        if 'error' in oob:
+            discussion += "System: " + oob['error'] + '\n'
+        elif res is not None:
+            discussion += "System: " + json.dumps(res) + "\n"
 
-        if not executed:
-            break
+        if args.debug:
+            print('-----')
+            print(discussion)
+            print('+++++')
+
         if 'end' in oob and oob['end']:
             r = input("> ")
             discussion += "\nUser:" + r + '\n'
+
+        if not executed:
+            break
 
         lines = continue_prompt(args.backend, discussion)
